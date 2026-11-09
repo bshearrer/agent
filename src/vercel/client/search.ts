@@ -29,12 +29,11 @@ import type {
   ActionCtx,
 } from "./types.js";
 import { inlineMessagesFiles } from "./files.js";
+import { docsToModelMessages, toModelMessage } from "../mapping.js";
 import {
-  autoDenyUnresolvedApprovals,
-  docsToModelMessages,
-  toModelMessage,
-} from "../mapping.js";
-import { prepareApprovalContext } from "./prepareApprovalContext.js";
+  planApprovals,
+  prepareApprovalContext,
+} from "./prepareApprovalContext.js";
 
 const DEFAULT_VECTOR_SCORE_THRESHOLD = 0.0;
 // Bound each page that completes an order split by the recent window.
@@ -341,7 +340,7 @@ export function filterOutOrphanedToolMessages(docs: MessageDoc[]) {
   };
 
   // Helper: check if tool call has a pending approval request
-  // (auto-deny handles these downstream, so they must survive the filter)
+  // (context handlers see these, and prepareApprovalContext leaves them out)
   const hasApprovalRequest = (toolCallId: string) => {
     return approvalRequestsByToolCallId.has(toolCallId);
   };
@@ -693,10 +692,12 @@ export async function fetchContextWithPrompt(
     }
   }
 
-  const continuation =
+  const approvals = planApprovals(
+    [...searchMessages, ...recentMessages],
     args.prompt === undefined
-      ? approvalContinuation(promptMessage, searchMessages, recentMessages)
-      : undefined;
+      ? approvalContinuation(promptMessage, recentMessages)
+      : undefined,
+  );
   const search = docsToModelMessages(searchMessages);
   const recent = docsToModelMessages(prePromptDocs);
   const inputMessages = messages.map(toModelMessage);
@@ -723,18 +724,7 @@ export async function fetchContextWithPrompt(
       })
     : allMessages;
 
-  if (continuation) {
-    processedMessages = prepareApprovalContext(
-      processedMessages,
-      continuation.approvalIds,
-      continuation.storedContext,
-    );
-  }
-
-  // Post-process: auto-deny unresolved approvals so the AI SDK sees a
-  // complete history. Applied after contextHandler so custom handlers
-  // don't need to handle this.
-  processedMessages = autoDenyUnresolvedApprovals(processedMessages);
+  processedMessages = prepareApprovalContext(processedMessages, approvals);
 
   // Process messages to inline localhost files (if not, file urls pointing to localhost will be sent to LLM providers)
   if (process.env.CONVEX_CLOUD_URL?.startsWith("http://127.0.0.1")) {
@@ -748,13 +738,10 @@ export async function fetchContextWithPrompt(
   };
 }
 
-// Read before the context handler runs and from copies, since the messages
-// it is given share nested objects with these docs.
 function approvalContinuation(
   promptMessage: MessageDoc | undefined,
-  searchMessages: MessageDoc[],
   recentMessages: MessageDoc[],
-): { approvalIds: Set<string>; storedContext: ModelMessage[] } | undefined {
+): Set<string> | undefined {
   if (
     promptMessage?.message?.role !== "tool" ||
     !promptMessage.message.content.some(
@@ -795,12 +782,7 @@ function approvalContinuation(
       "Approval continuation requires one complete request message",
     );
   }
-  return {
-    approvalIds,
-    storedContext: docsToModelMessages(
-      structuredClone([...searchMessages, ...recentMessages]),
-    ),
-  };
+  return approvalIds;
 }
 
 export function getPromptArray(
