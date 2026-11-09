@@ -157,7 +157,6 @@ describe("projectPersistedUIMessageChunks", () => {
         finishReason: "tool-calls",
         model: "model-1",
         provider: "provider-1",
-        sources: [],
         error: "interrupted",
       },
       {
@@ -176,7 +175,6 @@ describe("projectPersistedUIMessageChunks", () => {
         finishReason: "tool-calls",
         model: "model-1",
         provider: "provider-1",
-        sources: [],
         error: "interrupted",
       },
     ]);
@@ -291,7 +289,6 @@ describe("projectPersistedUIMessageChunks", () => {
         model: "model-1",
         provider: "provider-1",
         providerMetadata: { openai: { phase: "end" } },
-        sources: [],
       },
     ]);
   });
@@ -317,7 +314,6 @@ describe("projectPersistedUIMessageChunks", () => {
         finishReason: "stop",
         model: "model-1",
         provider: "provider-1",
-        sources: [],
       },
     ]);
   });
@@ -352,7 +348,6 @@ describe("projectPersistedUIMessageChunks", () => {
         finishReason: "tool-calls",
         model: "model-1",
         provider: "provider-1",
-        sources: [],
       },
       {
         message: {
@@ -370,7 +365,6 @@ describe("projectPersistedUIMessageChunks", () => {
         finishReason: "tool-calls",
         model: "model-1",
         provider: "provider-1",
-        sources: [],
       },
     ]);
   });
