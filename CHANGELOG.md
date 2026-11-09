@@ -14,6 +14,15 @@
   `output-error` (#162, #441)
 - Store a step's reasoning once, in content, so long reasoning fits the document
   size limit (#418, #423)
+- Keep message content and result metadata in their own rows, and each message's
+  text once, so saves and prompt context read less. `listMessages` and
+  `listUIMessages` take `textOnly`, which reads a fraction of a full page
+- Saved messages have no `sources` or `warnings` when there are none, instead of
+  empty arrays
+- A query or mutation reads at most 1,024 messages: pages stop there, and
+  `getMessagesByIds` and message search refuse more
+- `fetchContextMessages` and message search return what the model reads, without
+  usage, provider metadata, sources or warnings
 - `getFilesToDelete` and `deleteFiles` take a `lastTouchedBefore` cutoff to
   clean up recent unreferenced files (#361, #437)
 
