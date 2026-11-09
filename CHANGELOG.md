@@ -16,6 +16,12 @@
   size limit (#418, #423)
 - `getFilesToDelete` and `deleteFiles` take a `lastTouchedBefore` cutoff to
   clean up recent unreferenced files (#361, #437)
+- Save every step the AI SDK runs, fail the generation when a step save fails,
+  and keep provider errors in `fullStream` with `saveStreamDeltas`. A caller's
+  `onStepEnd` now runs before its step is saved, its `onEnd` after the last one,
+  and a step cut off by `stopStream` fails instead of staying pending (#388,
+  #419, #428)
+- Aborting a stream no longer fails a step that already finished, reversing #326
 
 ## 0.7.9
 
