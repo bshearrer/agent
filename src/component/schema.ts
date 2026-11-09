@@ -11,6 +11,7 @@ import {
   vProviderOptions,
   vProviderMetadata,
   vReasoningDetails,
+  vRole,
 } from "../validators.js";
 import { typedV } from "convex-helpers/validators";
 import vectorTables, { vVectorId } from "./vector/tables.js";
@@ -64,6 +65,17 @@ export const schema = defineSchema({
     parentMessageId: v.optional(v.id("messages")),
     stepId: v.optional(v.string()),
     files: v.optional(v.array(v.any())),
+
+    // Rows saved since messagePayloads keep `message` there and the result
+    // metadata in messageRecords, `role` for text views, and the approval ids
+    // the message requests or answers for approval lookups. The sizes let a
+    // byte budget count each tier before reading it.
+    payloadId: v.optional(v.id("messagePayloads")),
+    payloadSize: v.optional(v.number()),
+    recordId: v.optional(v.id("messageRecords")),
+    recordSize: v.optional(v.number()),
+    role: v.optional(vRole),
+    approvalIds: v.optional(v.array(v.string())),
   })
     // Allows finding successful visible messages in order
     // Also surface pending messages separately to e.g. stream
@@ -82,6 +94,26 @@ export const schema = defineSchema({
     })
     // Allows finding messages by vector embedding id
     .index("embeddingId_threadId", ["embeddingId", "threadId"]),
+
+  // Convex reads whole documents, so what a list or save doesn't need stays
+  // off the rows they scan: what the model reads here, and what only a full
+  // read returns in messageRecords.
+  messagePayloads: defineTable({
+    message: vMessage,
+    // Set when the message's text is left out, as its row's `text` holds it:
+    // the length of each text part's text, or of a string content.
+    textLengths: v.optional(v.array(v.number())),
+  }),
+
+  messageRecords: defineTable({
+    providerOptions: v.optional(vProviderOptions),
+    usage: v.optional(vUsage),
+    providerMetadata: v.optional(vProviderMetadata),
+    sources: v.optional(v.array(vSource)),
+    warnings: v.optional(v.array(vLanguageModelCallWarning)),
+    reasoning: v.optional(v.string()),
+    reasoningDetails: v.optional(vReasoningDetails),
+  }),
 
   // Status: if it's done, it's deleted, then deltas are vacuumed
   streamingMessages: defineTable({

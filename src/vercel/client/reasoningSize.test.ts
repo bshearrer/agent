@@ -21,12 +21,27 @@ const agentWith = (options: Parameters<typeof mockModel>[0]) =>
   });
 
 async function storedAssistant(t: T) {
-  const docs = (
-    await t.run((ctx) => ctx.db.query("messages").collect())
-  ).filter((doc) => doc.message?.role === "assistant");
-  expect(docs).toHaveLength(1);
-  expect(getDocumentSize(docs[0])).toBeLessThan(LONG.length * 1.5);
-  return docs[0];
+  const stored = await t.run(async (ctx) =>
+    Promise.all(
+      (await ctx.db.query("messages").collect()).map(async (doc) => {
+        const tiers = [
+          doc.payloadId && (await ctx.db.get("messagePayloads", doc.payloadId)),
+          doc.recordId && (await ctx.db.get("messageRecords", doc.recordId)),
+        ];
+        const bytes = [doc, ...tiers].reduce(
+          (sum, row) => sum + (row ? getDocumentSize(row) : 0),
+          0,
+        );
+        return { doc, bytes };
+      }),
+    ),
+  );
+  const assistants = stored.filter(
+    ({ doc }) => (doc.role ?? doc.message?.role) === "assistant",
+  );
+  expect(assistants).toHaveLength(1);
+  expect(assistants[0].bytes).toBeLessThan(LONG.length * 1.5);
+  return assistants[0].doc;
 }
 
 async function readAssistant(t: T, threadId: string) {

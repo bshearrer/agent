@@ -280,7 +280,7 @@ export function projectPersistedUIMessageChunkParts(
       ...(providerMetadataValue
         ? { providerMetadata: providerMetadataValue }
         : {}),
-      sources,
+      ...(sources.length > 0 ? { sources } : {}),
       ...(fileIds.length > 0
         ? { fileIds: fileIds as MessageWithMetadataInternal["fileIds"] }
         : {}),

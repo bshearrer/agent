@@ -1,10 +1,16 @@
 import { assert, omit, pick } from "convex-helpers";
-import { mergedStream, stream } from "convex-helpers/server/stream";
+import {
+  type IndexBounds,
+  type IndexKey,
+  mergedStream,
+  QueryStream,
+  stream,
+} from "convex-helpers/server/stream";
 import {
   paginationOptsValidator,
   type WithoutSystemFields,
 } from "convex/server";
-import type { ObjectType } from "convex/values";
+import { getDocumentSize, type ObjectType } from "convex/values";
 import {
   DEFAULT_MESSAGE_RANGE,
   DEFAULT_RECENT_MESSAGES,
@@ -42,6 +48,21 @@ import {
 } from "./vector/tables.js";
 import { changeRefcount } from "./files.js";
 import {
+  ChargingPayloads,
+  checkReadSize,
+  copyPayload,
+  deletePayload,
+  inBatches,
+  joinPayload,
+  MAX_MESSAGES_PER_READ,
+  mayHoldApproval,
+  readMessage,
+  readMessages,
+  storeMessageFields,
+  touchesPayload,
+  vMessageView,
+} from "./messagePayloads.js";
+import {
   getStreamingMessagesWithMetadata,
   finishHandler,
   releaseStreamFileOwnershipByIds,
@@ -64,6 +85,7 @@ export async function deleteMessage(
   messageDoc: Doc<"messages">,
 ) {
   await ctx.db.delete("messages", messageDoc._id);
+  await deletePayload(ctx, messageDoc);
   if (messageDoc.embeddingId) {
     const { tableName } = getVectorIdInfo(ctx, messageDoc.embeddingId);
     await ctx.db.delete(tableName, messageDoc.embeddingId);
@@ -352,7 +374,6 @@ async function addMessagesHandler(
       ...rest,
       ...message,
       embeddingId,
-      parentMessageId: promptMessageId,
       userId,
       tool: isTool(message.message),
       text: hideFromUserIdSearch ? undefined : extractText(message.message),
@@ -382,12 +403,22 @@ async function addMessagesHandler(
           message.fileIds,
         );
       }
-      await ctx.db.replace("messages", pendingMessage._id, {
-        ...messageDoc,
-        order: pendingMessage.order,
-        stepOrder: pendingMessage.stepOrder,
-      });
-      toReturn.push((await ctx.db.get("messages", pendingMessage._id))!);
+      const { row, payload } = await storeMessageFields(
+        ctx,
+        {
+          ...messageDoc,
+          order: pendingMessage.order,
+          stepOrder: pendingMessage.stepOrder,
+        },
+        pendingMessage,
+      );
+      await ctx.db.replace("messages", pendingMessage._id, row);
+      toReturn.push(
+        joinPayload(
+          (await ctx.db.get("messages", pendingMessage._id))!,
+          payload,
+        ),
+      );
       continue;
     }
     if ((startsAtNextOrder || explicitOrder !== undefined) && i === 0) {
@@ -413,16 +444,19 @@ async function addMessagesHandler(
       }
       stepOrder = incrementMessagePosition(stepOrder, "stepOrder");
     }
-    const messageId = await ctx.db.insert("messages", {
+    const { row, payload } = await storeMessageFields(ctx, {
       ...messageDoc,
       order,
       stepOrder,
     });
+    const messageId = await ctx.db.insert("messages", row);
     if (message.fileIds) {
       await changeRefcount(ctx, [], message.fileIds);
     }
     // TODO: delete the associated stream data for the order/stepOrder
-    toReturn.push((await ctx.db.get("messages", messageId))!);
+    toReturn.push(
+      joinPayload((await ctx.db.get("messages", messageId))!, payload),
+    );
   }
   // Atomically finish the stream if requested, preventing UI flickering
   // from separate mutations for message save and stream finish (issue #181).
@@ -494,8 +528,9 @@ export const finalizeMessage = mutation({
   },
   returns: v.null(),
   handler: async (ctx, { messageId, result }) => {
-    const message = await ctx.db.get("messages", messageId);
-    assert(message, `Message ${messageId} not found`);
+    const stored = await ctx.db.get("messages", messageId);
+    assert(stored, `Message ${messageId} not found`);
+    const message = await readMessage(ctx, stored, "model");
     if (message.status !== "pending") {
       console.debug(
         "Trying to finalize a message that's already",
@@ -596,8 +631,24 @@ export const updateMessage = mutation({
       patch.embeddingId = undefined;
     }
 
-    await ctx.db.patch("messages", args.messageId, patch);
-    return publicMessage((await ctx.db.get("messages", args.messageId))!);
+    if (!touchesPayload(args.patch)) {
+      await ctx.db.patch("messages", args.messageId, patch);
+      return publicMessage(
+        await readMessage(ctx, (await ctx.db.get("messages", args.messageId))!),
+      );
+    }
+    const { row, payload } = await storeMessageFields(
+      ctx,
+      {
+        ...omit(await readMessage(ctx, message), ["_id", "_creationTime"]),
+        ...patch,
+      },
+      message,
+    );
+    await ctx.db.replace("messages", args.messageId, row);
+    return publicMessage(
+      joinPayload((await ctx.db.get("messages", args.messageId))!, payload),
+    );
   },
 });
 
@@ -620,8 +671,13 @@ export const respondToToolCallApprovals = mutation({
       order: "desc",
       paginationOpts: { cursor: null, numItems: APPROVAL_LOOKUP_MESSAGES },
     });
+    const approvalIds = new Set(args.decisions.map((d) => d.approvalId));
     const plan = planToolCallApprovals(
-      page.page,
+      await readMessages(
+        ctx,
+        page.page.filter((row) => mayHoldApproval(row, approvalIds)),
+        "model",
+      ),
       args.decisions,
       args.threadId,
     );
@@ -651,6 +707,115 @@ const cloneMessageArgs = {
   // defaults to 0. the messages will be inserted starting at this order.
   insertAtOrder: v.optional(v.number()),
 };
+// A clone batch reads what it copies: each row, its tiers, its vector and its
+// files, whose refcounts it then writes. It stops before the row that would
+// pass a budget of bytes or of `db.get` calls, which leave room for its writes
+// and the page's own reads.
+const COPY_BYTES = 6 * 1024 * 1024;
+const COPY_READS = 3 * MAX_MESSAGES_PER_READ;
+// Copies run together, each making at most two operations at once, and Convex
+// allows a function 1,000.
+const CONCURRENT_COPIES = 400;
+
+/**
+ * The rows a clone batch can copy within its budget, reading each row's files
+ * into `files` as it admits the row. A row is passed on once the next is known
+ * to fit, so pagination ends before the first that doesn't, with no read past
+ * one file over the budget. The first row is always admitted.
+ */
+class CopyBudget extends QueryStream<Doc<"messages">> {
+  #rows: QueryStream<Doc<"messages">>;
+  #ctx: QueryCtx;
+  #files: Map<Id<"files">, Doc<"files"> | null>;
+  #limit: number;
+  constructor(
+    rows: QueryStream<Doc<"messages">>,
+    ctx: QueryCtx,
+    files: Map<Id<"files">, Doc<"files"> | null>,
+    limit: number,
+  ) {
+    super();
+    this.#rows = rows;
+    this.#ctx = ctx;
+    this.#files = files;
+    this.#limit = limit;
+  }
+  iterWithKeys(trackBandwidth = false) {
+    const rows = this.#rows.iterWithKeys(trackBandwidth);
+    const ctx = this.#ctx;
+    const files = this.#files;
+    const limit = this.#limit;
+    let bytes = 0;
+    let reads = 0;
+    let admitted = 0;
+    // Whether the row fits after those admitted, reading its files if so.
+    const admit = async (row: Doc<"messages">, bandwidth: number) => {
+      const first = admitted === 0;
+      const vector = row.embeddingId
+        ? 8 * getVectorIdInfo(ctx, row.embeddingId).dimension
+        : 0;
+      const unread = [...new Set(row.fileIds ?? [])].filter(
+        (id) => !files.has(id),
+      );
+      let rowBytes = bandwidth + vector;
+      const rowReads =
+        Number(!!row.payloadId) +
+        Number(!!row.recordId) +
+        Number(!!row.embeddingId) +
+        unread.length;
+      const fits = () =>
+        first ||
+        (reads + rowReads <= COPY_READS && bytes + rowBytes <= COPY_BYTES);
+      if (!fits()) return false;
+      for (const id of unread) {
+        const file = await ctx.db.get("files", id);
+        files.set(id, file);
+        rowBytes += file ? 2 * getDocumentSize(file) : 0;
+        if (!fits()) return false;
+      }
+      bytes += rowBytes;
+      reads += rowReads;
+      admitted++;
+      return true;
+    };
+    return {
+      async *[Symbol.asyncIterator](): AsyncGenerator<
+        [Doc<"messages"> | null, IndexKey, number],
+        undefined
+      > {
+        let held: [Doc<"messages">, IndexKey] | undefined;
+        for await (const [row, indexKey, bandwidth] of rows) {
+          if (!row) continue;
+          if (admitted >= limit || !(await admit(row, bandwidth))) {
+            if (held) yield [...held, Infinity];
+            return;
+          }
+          if (held) yield [...held, 0];
+          held = [row, indexKey];
+        }
+        if (held) yield [...held, 0];
+      },
+    };
+  }
+  narrow(indexBounds: IndexBounds) {
+    return new CopyBudget(
+      this.#rows.narrow(indexBounds),
+      this.#ctx,
+      this.#files,
+      this.#limit,
+    );
+  }
+  getOrder() {
+    return this.#rows.getOrder();
+  }
+  getIndexFields() {
+    return this.#rows.getIndexFields();
+  }
+  getEqualityIndexFilter() {
+    return this.#rows.getEqualityIndexFilter();
+  }
+}
+
 export const cloneMessageBatch = internalMutation({
   args: {
     ...cloneMessageArgs,
@@ -665,14 +830,31 @@ export const cloneMessageBatch = internalMutation({
     isDone: boolean;
   }> => {
     const orderOffset = args.insertAtOrder ?? 0;
-    const result = await listMessagesByThreadIdHandler(ctx, {
-      threadId: args.sourceThreadId,
-      excludeToolMessages: args.excludeToolMessages,
-      order: "desc",
-      paginationOpts: args.paginationOpts,
-      statuses: args.statuses,
-      upToAndIncludingMessageId: args.upToAndIncludingMessageId,
-    });
+    const files = new Map<Id<"files">, Doc<"files"> | null>();
+    const refs = new Map<Id<"files">, number>();
+    const result = await listMessagesByThreadIdHandler(
+      ctx,
+      {
+        threadId: args.sourceThreadId,
+        excludeToolMessages: args.excludeToolMessages,
+        order: "desc",
+        paginationOpts: {
+          ...args.paginationOpts,
+          maximumBytesRead: 1,
+        },
+        statuses: args.statuses,
+        upToAndIncludingMessageId: args.upToAndIncludingMessageId,
+      },
+      {
+        limitPage: (rows) =>
+          new CopyBudget(
+            rows,
+            ctx,
+            files,
+            Math.min(args.paginationOpts.numItems, CONCURRENT_COPIES),
+          ),
+      },
+    );
 
     const existing =
       result.page.length === 0
@@ -704,9 +886,8 @@ export const cloneMessageBatch = internalMutation({
             ),
         )
         .map(async (m) => {
-          // update file refs
-          if (m.fileIds) {
-            await changeRefcount(ctx, [], m.fileIds);
+          for (const fileId of new Set(m.fileIds ?? [])) {
+            refs.set(fileId, (refs.get(fileId) ?? 0) + 1);
           }
           let embeddingId: VectorTableId | undefined = undefined;
           if (m.embeddingId) {
@@ -738,9 +919,20 @@ export const cloneMessageBatch = internalMutation({
             embeddingId,
             threadId: args.targetThreadId,
             order: orderOffset + m.order,
+            ...(await copyPayload(ctx, m)),
           });
         }),
     );
+    await inBatches([...refs], async ([fileId, count]) => {
+      const file = files.get(fileId);
+      if (!file) {
+        throw new Error(`File ${fileId} not found when incrementing refcount`);
+      }
+      await ctx.db.patch("files", fileId, {
+        refcount: file.refcount + count,
+        lastTouchedAt: Date.now(),
+      });
+    });
     return {
       numCopied: result.page.length,
       continueCursor: result.continueCursor,
@@ -795,6 +987,12 @@ export const listMessagesByThreadIdArgs = {
   paginationOpts: v.optional(paginationOptsValidator),
   statuses: v.optional(v.array(vMessageStatus)),
   upToAndIncludingMessageId: v.optional(v.id("messages")),
+  /**
+   * "text" returns each message as its role and text and skips tool
+   * messages, like excludeToolMessages. "model" leaves out what only a full
+   * read needs, like provider metadata and usage. "full" by default.
+   */
+  view: v.optional(vMessageView),
 };
 export const listMessagesByThreadId = query({
   args: listMessagesByThreadIdArgs,
@@ -802,7 +1000,8 @@ export const listMessagesByThreadId = query({
     const messages = await listMessagesByThreadIdHandler(ctx, args, {
       keepContinuedOrderTools: true,
     });
-    return { ...messages, page: messages.page.map(publicMessage) };
+    const page = await readMessages(ctx, messages.page, args.view);
+    return { ...messages, page: page.map(publicMessage) };
   },
   returns: vPaginationResult(vMessageDoc),
 });
@@ -810,7 +1009,15 @@ export const listMessagesByThreadId = query({
 async function listMessagesByThreadIdHandler(
   ctx: QueryCtx,
   args: ObjectType<typeof listMessagesByThreadIdArgs>,
-  { keepContinuedOrderTools = false } = {},
+  {
+    keepContinuedOrderTools = false,
+    limitPage = (rows) => rows,
+  }: {
+    keepContinuedOrderTools?: boolean;
+    limitPage?: (
+      rows: QueryStream<Doc<"messages">>,
+    ) => QueryStream<Doc<"messages">>;
+  } = {},
 ) {
   const statuses = args.statuses ?? vMessageStatus.members.map((m) => m.value);
   const last =
@@ -820,7 +1027,9 @@ async function listMessagesByThreadIdHandler(
     !last || last.threadId === args.threadId,
     "upToAndIncludingMessageId must be a message in the thread",
   );
-  const toolOptions = args.excludeToolMessages ? [false] : [true, false];
+  const view = args.view ?? "full";
+  const toolOptions =
+    args.excludeToolMessages || view === "text" ? [false] : [true, false];
   const order = args.order ?? "desc";
   const streams = toolOptions.flatMap((tool) =>
     statuses.map((status) =>
@@ -841,8 +1050,13 @@ async function listMessagesByThreadIdHandler(
   );
   // Excluding tool messages trims earlier orders. The order being continued
   // keeps them, or an approval loses its call and decision (#409). Cloning
-  // reuses this handler and wants strict exclusion.
-  if (args.excludeToolMessages && last && keepContinuedOrderTools) {
+  // reuses this handler and wants strict exclusion, as does a text view.
+  if (
+    args.excludeToolMessages &&
+    view !== "text" &&
+    last &&
+    keepContinuedOrderTools
+  ) {
     streams.push(
       ...statuses.map((status) =>
         stream(ctx.db, schema)
@@ -858,28 +1072,41 @@ async function listMessagesByThreadIdHandler(
       ),
     );
   }
-  const messages = await mergedStream(streams, ["order", "stepOrder"]).paginate(
-    args.paginationOpts ?? {
+  const messages = await limitPage(
+    mergedStream(
+      streams.map((s) => new ChargingPayloads(s, view)),
+      ["order", "stepOrder"],
+    ),
+  ).paginate({
+    ...(args.paginationOpts ?? {
       numItems: DEFAULT_RECENT_MESSAGES,
       cursor: null,
-    },
-  );
+    }),
+    maximumRowsRead: Math.min(
+      args.paginationOpts?.maximumRowsRead ?? Infinity,
+      MAX_MESSAGES_PER_READ,
+    ),
+  });
   if (messages.page.length === 0) {
     messages.isDone = true;
   }
   return messages;
 }
 
+/** Reads at most 1,024 messages at once. */
 export const getMessagesByIds = query({
   args: { messageIds: v.array(v.id("messages")) },
   handler: async (ctx, args) => {
-    return (
-      await Promise.all(args.messageIds.map((id) => ctx.db.get("messages", id)))
-    ).map((m) => (m ? publicMessage(m) : null));
+    checkReadSize(args.messageIds.length);
+    return inBatches(args.messageIds, async (id) => {
+      const m = await ctx.db.get("messages", id);
+      return m ? publicMessage(await readMessage(ctx, m)) : null;
+    });
   },
   returns: v.array(v.union(v.null(), vMessageDoc)),
 });
 
+/** Messages for a prompt, so each holds what the model reads. */
 export const searchMessages = action({
   args: {
     threadId: v.optional(v.id("threads")),
@@ -994,7 +1221,7 @@ export const _fetchSearchMessages = internalQuery({
       searchAllMessagesForUserId || threadId,
       "Specify searchAllMessagesForUserId or threadId to search",
     );
-    let messages: MessageDoc[] = (
+    const hits = (
       await Promise.all(
         args.embeddingIds.map((embeddingId) =>
           ctx.db
@@ -1016,27 +1243,36 @@ export const _fetchSearchMessages = internalQuery({
             .first(),
         ),
       )
-    )
-      .filter((m): m is Doc<"messages"> => {
-        if (m === undefined || m === null || m.tool) return false;
-        if (!beforeMessage) return true;
-        // The order filter is only meaningful within the same thread.
-        // Messages from other threads have independent order sequences.
-        if (m.threadId !== beforeMessage.threadId) return true;
-        return (
-          m.order < beforeMessage.order ||
-          (m.order === beforeMessage.order &&
-            m.stepOrder < beforeMessage.stepOrder)
-        );
-      })
-      .map(publicMessage);
-    messages.push(...(args.textSearchMessages ?? []));
+    ).filter((m): m is Doc<"messages"> => {
+      if (m === undefined || m === null || m.tool) return false;
+      if (!beforeMessage) return true;
+      // The order filter is only meaningful within the same thread.
+      // Messages from other threads have independent order sequences.
+      if (m.threadId !== beforeMessage.threadId) return true;
+      return (
+        m.order < beforeMessage.order ||
+        (m.order === beforeMessage.order &&
+          m.stepOrder < beforeMessage.stepOrder)
+      );
+    });
     // TODO: prioritize more recent messages
-    messages = sorted(messages);
-    messages = messages.slice(0, args.limit);
+    const messages = sorted<Doc<"messages"> | MessageDoc>([
+      ...hits,
+      ...(args.textSearchMessages ?? []),
+    ]).slice(0, args.limit);
+    const found = new Set(hits.map((m) => m._id));
+    const rows = messages.filter((m): m is Doc<"messages"> =>
+      found.has(m._id as Id<"messages">),
+    );
+    const read = messages.filter(
+      (m): m is MessageDoc => !found.has(m._id as Id<"messages">),
+    );
     // Fetch the surrounding messages
     if (!threadId) {
-      return messages;
+      return sorted([
+        ...read,
+        ...(await readMessages(ctx, rows, "model")).map(publicMessage),
+      ]);
     }
     const included: Record<string, Set<number>> = {};
     for (const m of messages) {
@@ -1084,17 +1320,23 @@ export const _fetchSearchMessages = internalQuery({
         ranges[searchId].push(...surrounding);
       }
     }
+    const neighbours = new Map<string, Doc<"messages">>();
     for (const r of Object.values(ranges).flat()) {
       if (!messages.some((m) => m._id === r._id)) {
-        messages.push(publicMessage(r));
+        neighbours.set(r._id, r);
       }
     }
-    return sorted(messages);
+    const joined = await readMessages(
+      ctx,
+      [...rows, ...neighbours.values()],
+      "model",
+    );
+    return sorted([...read, ...joined.map(publicMessage)]);
   },
 });
 
 // returns ranges of messages in order of text search relevance,
-// excluding duplicates in later ranges.
+// excluding duplicates in later ranges, as the model reads them.
 export const textSearch = query({
   args: {
     threadId: v.optional(v.id("threads")),
@@ -1138,19 +1380,18 @@ export const textSearch = query({
         return qq;
       })
       .take(args.limit);
-    return messages
-      .filter((m) => {
-        if (!targetMessage) return true;
-        // Order is only meaningful within the same thread; cross-thread
-        // results have independent order sequences and should pass through.
-        if (m.threadId !== targetMessage.threadId) return true;
-        return (
-          m.order < targetMessage.order ||
-          (m.order === targetMessage.order &&
-            m.stepOrder < targetMessage.stepOrder)
-        );
-      })
-      .map(publicMessage);
+    const matches = messages.filter((m) => {
+      if (!targetMessage) return true;
+      // Order is only meaningful within the same thread; cross-thread
+      // results have independent order sequences and should pass through.
+      if (m.threadId !== targetMessage.threadId) return true;
+      return (
+        m.order < targetMessage.order ||
+        (m.order === targetMessage.order &&
+          m.stepOrder < targetMessage.stepOrder)
+      );
+    });
+    return (await readMessages(ctx, matches, "model")).map(publicMessage);
   },
   returns: v.array(vMessageDoc),
 });

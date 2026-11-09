@@ -316,7 +316,7 @@ async function scenario({
   if (olderMessages > 0) {
     const batchSize =
       typeof transactionLimits === "object"
-        ? Math.min(10, transactionLimits.documentsWritten ?? 10)
+        ? Math.min(10, (transactionLimits.documentsWritten ?? 20) / 2)
         : 10;
     for (let start = 0; start < olderMessages; start += batchSize) {
       await t.run((ctx) =>
@@ -651,7 +651,7 @@ describe("tool approval semantics", () => {
     },
   );
 
-  test("records a substantial batch with one bounded read and one write", async () => {
+  test("records a substantial batch with one bounded read and two writes", async () => {
     const ids = Array.from({ length: 24 }, (_, index) => `approval-${index}`);
     const olderMessages = 80;
     const s = await scenario({
@@ -659,8 +659,8 @@ describe("tool approval semantics", () => {
       olderMessages,
       transactionLimits: {
         bytesRead: 1_000_000,
-        documentsRead: olderMessages + 20,
-        documentsWritten: 1,
+        documentsRead: 2 * (olderMessages + 20),
+        documentsWritten: 2,
       },
     });
 
